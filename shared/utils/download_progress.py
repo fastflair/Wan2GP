@@ -215,6 +215,36 @@ def _xet_get(*, incomplete_path, xet_file_data, headers, expected_size=None, dis
             waiter.shutdown(wait=True)
 
 
+def _hf_has_legacy_internals(hf):
+    """The custom _http_get/_xet_get target huggingface_hub<1.0 (requests based).
+    Newer releases (httpx based) dropped/moved these helpers and pass extra
+    kwargs such as tqdm_class, so there we wrap the original functions instead."""
+    return all(hasattr(hf, name) for name in ("_request_wrapper", "refresh_xet_connection_info", "reset_sessions"))
+
+
+def _progress_tqdm_class(progress, base=None):
+    """tqdm subclass that mirrors byte progress into WanGP and checks for cancellation."""
+    if base is None:
+        from huggingface_hub.utils import tqdm as base
+
+    class _WanGPProgressTqdm(base):
+        def update(self, n=1):
+            result = super().update(n)
+            # Raises DownloadCancelled when the task was aborted.
+            progress.update(int(self.n or 0), self.total)
+            return result
+
+    return _WanGPProgressTqdm
+
+
+def _call_with_progress(original, progress, args, kwargs):
+    if kwargs.get("_tqdm_bar") is None:
+        kwargs = dict(kwargs, tqdm_class=_progress_tqdm_class(progress, kwargs.get("tqdm_class")))
+    check_download_cancelled(progress.gen)
+    original(*args, **kwargs)
+    check_download_cancelled(progress.gen)
+
+
 def install_hf_download_patch():
     from huggingface_hub import file_download as hf
 
@@ -224,17 +254,24 @@ def install_hf_download_patch():
     original_http_get = hf.http_get
     original_xet_get = hf.xet_get
     original_download = hf._download_to_tmp_and_move
+    legacy = _hf_has_legacy_internals(hf)
 
     @wraps(original_http_get)
     def http_get(*args, **kwargs):
-        if _current_download.get() is None:
+        progress = _current_download.get()
+        if progress is None:
             return original_http_get(*args, **kwargs)
+        if not legacy:
+            return _call_with_progress(original_http_get, progress, args, kwargs)
         return _http_get(*args, **kwargs)
 
     @wraps(original_xet_get)
     def xet_get(*args, **kwargs):
-        if _current_download.get() is None:
+        progress = _current_download.get()
+        if progress is None:
             return original_xet_get(*args, **kwargs)
+        if not legacy:
+            return _call_with_progress(original_xet_get, progress, args, kwargs)
         return _xet_get(*args, **kwargs)
 
     @wraps(original_download)

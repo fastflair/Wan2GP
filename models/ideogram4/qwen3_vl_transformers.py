@@ -407,6 +407,24 @@ class Qwen3VLVisionBlock(nn.Module):
         return hidden_states
 
 
+def _compute_default_rope_parameters(config, device=None, seq_len=None):
+    """Plain RoPE inverse frequencies. transformers>=5 no longer registers a
+    "default" entry in ROPE_INIT_FUNCTIONS, so keep a local implementation."""
+    rope_parameters = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+    base = getattr(config, "rope_theta", None) or rope_parameters.get("rope_theta", 10000.0)
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", None) or rope_parameters.get("partial_rotary_factor", 1.0)
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    dim = int(head_dim * partial_rotary_factor)
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
+    return inv_freq, 1.0
+
+
+def _get_rope_init_fn(rope_type):
+    if rope_type == "default":
+        return ROPE_INIT_FUNCTIONS.get("default", _compute_default_rope_parameters)
+    return ROPE_INIT_FUNCTIONS[rope_type]
+
+
 class Qwen3VLTextRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
@@ -420,7 +438,7 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = _get_rope_init_fn(self.rope_type)
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -1082,7 +1100,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
     def __init__(self, config: Qwen3VLTextConfig):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
